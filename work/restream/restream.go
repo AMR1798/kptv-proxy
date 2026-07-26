@@ -1,6 +1,7 @@
 package restream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -778,16 +779,28 @@ func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([
 	// Read the entire body for playlist parsing
 	body, err := io.ReadAll(resp.Body)
 	validationTimer.Stop()
-	cancel()
 	resp.Body.Close()
 	if err != nil {
+		cancel()
 		logger.Error("{restream/restream - getStreamVariants} Failed to read response body for channel %s: %v", r.Channel.Name, err)
 		return nil, false, nil, nil, err
 	}
 
 	// Parse the body as a master playlist and return variants
 	variants, isMaster, perr := masterHandler.ProcessMasterPlaylistVariants(string(body), url, r.Channel.Name)
-	return variants, isMaster, nil, nil, perr
+	if perr != nil {
+		cancel()
+		return nil, false, nil, nil, perr
+	}
+	if !isMaster {
+		// Playlist detection consumed the response. Restore it so the caller can
+		// sniff media playlists and other small responses under the direct-stream contract.
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return variants, false, resp, cancel, nil
+	}
+
+	cancel()
+	return variants, true, nil, nil, nil
 }
 
 // testAndStreamVariant attempts to validate and stream from a variant URL.
