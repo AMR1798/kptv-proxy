@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -53,6 +55,25 @@ func TestProcessXCBatchesWithCategoryAndVODMetadata(t *testing.T) {
 	}
 	if vod[0].ContentType != types.ContentTypeVOD || vod[0].ContainerExtension != "mp4" || vod[0].URL != "http://provider/movie/u/p/3.mp4" {
 		t.Fatalf("VOD stream metadata = %#v", vod[0])
+	}
+}
+
+func TestProcessXCBatchesPreservesProviderOrder(t *testing.T) {
+	items := make([]XCLiveStream, 2001)
+	for i := range items {
+		items[i] = XCLiveStream{StreamID: i + 1, Name: fmt.Sprintf("Channel %04d", i)}
+	}
+	source := &config.SourceConfig{URL: "http://provider"}
+	streams := processXCBatches(context.Background(), items, 4, func(batch []XCLiveStream) []*types.Stream {
+		return processLiveBatchWorker(batch, nil, source)
+	})
+	if len(streams) != len(items) {
+		t.Fatalf("processXCBatches() returned %d streams, want %d", len(streams), len(items))
+	}
+	for i, stream := range streams {
+		if stream.Name != items[i].Name {
+			t.Fatalf("stream %d = %q, want %q", i, stream.Name, items[i].Name)
+		}
 	}
 }
 

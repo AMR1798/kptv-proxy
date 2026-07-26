@@ -230,8 +230,16 @@ func processXCBatches[T any](ctx context.Context, items []T, workers int, proces
 		workers = 1
 	}
 	const batchSize = 1000
-	workChan := make(chan []T)
-	resultsChan := make(chan []*types.Stream)
+	type batchJob struct {
+		index int
+		items []T
+	}
+	type batchResult struct {
+		index   int
+		streams []*types.Stream
+	}
+	workChan := make(chan batchJob)
+	resultsChan := make(chan batchResult)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -241,13 +249,13 @@ func processXCBatches[T any](ctx context.Context, items []T, workers int, proces
 				select {
 				case <-ctx.Done():
 					return
-				case batch, ok := <-workChan:
+				case job, ok := <-workChan:
 					if !ok {
 						return
 					}
-					results := process(batch)
+					results := process(job.items)
 					select {
-					case resultsChan <- results:
+					case resultsChan <- batchResult{index: job.index, streams: results}:
 					case <-ctx.Done():
 						return
 					}
@@ -263,7 +271,7 @@ func processXCBatches[T any](ctx context.Context, items []T, workers int, proces
 				end = len(items)
 			}
 			select {
-			case workChan <- items[start:end]:
+			case workChan <- batchJob{index: start / batchSize, items: items[start:end]}:
 			case <-ctx.Done():
 				return
 			}
@@ -273,8 +281,15 @@ func processXCBatches[T any](ctx context.Context, items []T, workers int, proces
 		wg.Wait()
 		close(resultsChan)
 	}()
+	batchCount := (len(items) + batchSize - 1) / batchSize
+	ordered := make([][]*types.Stream, batchCount)
+	for result := range resultsChan {
+		if result.index >= 0 && result.index < len(ordered) {
+			ordered[result.index] = result.streams
+		}
+	}
 	var results []*types.Stream
-	for batch := range resultsChan {
+	for _, batch := range ordered {
 		results = append(results, batch...)
 	}
 	return results
@@ -364,7 +379,7 @@ func ParseXtremeCodesAPI(httpClient *client.HeaderSettingClient, cfg *config.Con
 	})...)
 
 	logger.Debug("{parser/xtremecodes - ParseXtremeCodesAPI} XC API parsing complete: %d total streams", len(allStreams))
-	if len(allStreams) > 0 && liveCategoryOK && seriesCategoryOK && vodCategoryOK && liveOK && seriesOK && vodOK {
+	if ctx.Err() == nil && len(allStreams) > 0 && liveCategoryOK && seriesCategoryOK && vodCategoryOK && liveOK && seriesOK && vodOK {
 		if data, err := json.Marshal(allStreams); err == nil {
 			cache.SetXCData(cacheKey, string(data))
 			logger.Debug("{parser/xtremecodes - ParseXtremeCodesAPI} Cached %d streams for %s", len(allStreams), source.Name)

@@ -698,6 +698,10 @@ channel for failover, even when their content types differ.
 | `enableSeries` | No | Include series (default: false) |
 | `enableVOD` | No | Include VOD (default: false) |
 
+The `enableLive`, `enableSeries`, and `enableVOD` flags control playlist and
+catalog listings. Direct authenticated stream routes retain the existing
+credential-based access behavior.
+
 ## Monitoring & Troubleshooting
 
 ### Health Monitoring
