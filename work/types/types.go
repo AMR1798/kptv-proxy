@@ -28,6 +28,18 @@ const (
 	StreamTypeHLS                      // HTTP Live Streaming (HLS) with adaptive bitrate and segment management
 )
 
+// ContentType identifies the kind of content represented by a stream. It is
+// intentionally separate from StreamType, which describes the transport
+// protocol used to serve the stream.
+type ContentType string
+
+const (
+	ContentTypeUnknown ContentType = ""
+	ContentTypeLive    ContentType = "live"
+	ContentTypeVOD     ContentType = "vod"
+	ContentTypeSeries  ContentType = "series"
+)
+
 // Stream represents a single streamable content source with comprehensive metadata,
 // reliability tracking, and format-specific configuration. Each stream corresponds to
 // a specific quality/variant of a channel and maintains its own failure statistics,
@@ -39,19 +51,21 @@ const (
 // is ensured through atomic operations for counters and mutex protection for
 // complex state updates.
 type Stream struct {
-	URL         string               // Complete URL of the streamable content source
-	Name        string               // Human-readable display name for the stream/channel
-	Attributes  map[string]string    // Key-value pairs from M3U8 EXTINF metadata (tvg-id, group-title, etc.)
-	Source      *config.SourceConfig // Reference to source configuration for authentication and limits
-	Failures    int32                // Atomic counter of consecutive failures for reliability tracking
-	LastFail    time.Time            // Timestamp of most recent failure for debugging and analysis
-	Blocked     int32                // Atomic flag (0=active, 1=blocked) indicating stream availability
-	Mu          sync.Mutex           // Mutex for thread-safe access to non-atomic fields (LastFail, ResolvedURL)
-	StreamType  StreamType           // Content type classification for specialized processing logic
-	ResolvedURL string               // For HLS master playlists, contains the selected variant URL
-	LastChecked time.Time            // Timestamp of most recent stream validation or health check
-	URLHash     string               // FNV64a hash of URL, assigned on import, never persisted
-	ImportOrder int                  // Original position within the imported source playlist/API response
+	URL                string               // Complete URL of the streamable content source
+	Name               string               // Human-readable display name for the stream/channel
+	Attributes         map[string]string    // Key-value pairs from M3U8 EXTINF metadata (tvg-id, group-title, etc.)
+	Source             *config.SourceConfig // Reference to source configuration for authentication and limits
+	Failures           int32                // Atomic counter of consecutive failures for reliability tracking
+	LastFail           time.Time            // Timestamp of most recent failure for debugging and analysis
+	Blocked            int32                // Atomic flag (0=active, 1=blocked) indicating stream availability
+	Mu                 sync.Mutex           // Mutex for thread-safe access to non-atomic fields (LastFail, ResolvedURL)
+	StreamType         StreamType           // Content type classification for specialized processing logic
+	ContentType        ContentType          // Semantic content kind (live, vod, or series), when known
+	ContainerExtension string               // Media container extension used for VOD URLs, when known
+	ResolvedURL        string               // For HLS master playlists, contains the selected variant URL
+	LastChecked        time.Time            // Timestamp of most recent stream validation or health check
+	URLHash            string               // FNV64a hash of URL, assigned on import, never persisted
+	ImportOrder        int                  // Original position within the imported source playlist/API response
 }
 
 // Channel represents a logical grouping of streams that provide the same content

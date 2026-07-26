@@ -677,6 +677,15 @@ All `/api/*` endpoints require either a valid session cookie or a `Authorization
 | `vodIncludeRegex` | No | Only include VOD matching pattern | `""` |
 | `vodExcludeRegex` | No | Exclude VOD matching pattern | `""` |
 
+When a source has XC credentials, the importer fetches live, series, and VOD
+catalogs plus their category names. Category names are preserved as the
+provider supplied them (with each content type kept as a separate stream
+classification), and missing category responses fall back to the content type
+name. The live, series, and VOD regex filters are applied after the complete
+catalog is fetched, so changing a filter does not require re-fetching the
+provider data. Streams with the same display name are still aggregated into one
+channel for failover, even when their content types differ.
+
 ### XC Output Account Settings
 
 | Setting | Required | Description |
