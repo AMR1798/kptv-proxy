@@ -12,6 +12,7 @@ import (
 	"kptv-proxy/work/types"
 	"kptv-proxy/work/utils"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,6 +63,33 @@ type xcStream struct {
 	DirectSource       string `json:"direct_source"`
 	TVArchiveDuration  int    `json:"tv_archive_duration"`
 	ContainerExtension string `json:"container_extension,omitempty"`
+}
+
+// xcVODDetails is the allowlisted metadata block returned by get_vod_info.
+type xcVODDetails struct {
+	Name           string   `json:"name"`
+	OName          string   `json:"o_name"`
+	CoverBig       string   `json:"cover_big"`
+	MovieImage     string   `json:"movie_image"`
+	ReleaseDate    string   `json:"releasedate"`
+	YoutubeTrailer string   `json:"youtube_trailer"`
+	Director       string   `json:"director"`
+	Actors         string   `json:"actors"`
+	Cast           string   `json:"cast"`
+	Description    string   `json:"description"`
+	Plot           string   `json:"plot"`
+	Country        string   `json:"country"`
+	Genre          string   `json:"genre"`
+	BackdropPath   []string `json:"backdrop_path"`
+	DurationSecs   int      `json:"duration_secs"`
+	Duration       string   `json:"duration"`
+	Bitrate        int      `json:"bitrate"`
+	Rating         string   `json:"rating"`
+}
+
+type xcVODInfoResponse struct {
+	Info      xcVODDetails `json:"info"`
+	MovieData xcStream     `json:"movie_data"`
 }
 
 // xcCategory represents a category in XC API output.
@@ -180,7 +208,7 @@ func buildXCStreamURL(baseURL, contentType, username, password string, streamID 
 		pathType = "series"
 		suffix = utils.NormalizeContainerExtension(extension)
 	}
-	return fmt.Sprintf("%s/%s/%s/%s/%d.%s", baseURL, pathType, username, password, streamID, suffix)
+	return fmt.Sprintf("%s/%s/%s/%s/%d.%s", baseURL, pathType, url.PathEscape(username), url.PathEscape(password), streamID, suffix)
 }
 
 // findXCAccount locates an XC output account by username and password.
@@ -205,6 +233,61 @@ func findChannelByStreamID(sp *proxy.StreamProxy, id int) string {
 		return true
 	})
 	return found
+}
+
+func buildVODInfo(sp *proxy.StreamProxy, streamID int, baseURL, username, password string) (xcVODInfoResponse, bool) {
+	channelName := findChannelByStreamID(sp, streamID)
+	if channelName == "" {
+		return xcVODInfoResponse{}, false
+	}
+	channel, exists := sp.Channels.Load(channelName)
+	if !exists {
+		return xcVODInfoResponse{}, false
+	}
+
+	channel.Mu.RLock()
+	defer channel.Mu.RUnlock()
+	if len(channel.Streams) == 0 || getChannelContentType(channel) != "vod" {
+		return xcVODInfoResponse{}, false
+	}
+
+	stream := channel.Streams[0]
+	attrs := stream.Attributes
+	extension := utils.NormalizeContainerExtension(stream.ContainerExtension)
+	group := attrs["group-title"]
+	logo := attrs["tvg-logo"]
+	directURL := buildXCStreamURL(baseURL, "vod", username, password, streamID, extension)
+
+	return xcVODInfoResponse{
+		Info: xcVODDetails{
+			Name:           channelName,
+			OName:          channelName,
+			CoverBig:       logo,
+			MovieImage:     logo,
+			ReleaseDate:    attrs["release-date"],
+			YoutubeTrailer: attrs["youtube-trailer"],
+			Director:       attrs["director"],
+			Actors:         attrs["actors"],
+			Cast:           attrs["cast"],
+			Description:    attrs["description"],
+			Plot:           attrs["plot"],
+			Country:        attrs["country"],
+			Genre:          attrs["genre"],
+			BackdropPath:   []string{},
+			Duration:       attrs["duration"],
+			Rating:         attrs["rating"],
+		},
+		MovieData: xcStream{
+			Name:               channelName,
+			StreamType:         "vod",
+			StreamID:           streamID,
+			StreamIcon:         logo,
+			Added:              "0",
+			CategoryID:         categoryIDFromName(group),
+			DirectSource:       directURL,
+			ContainerExtension: extension,
+		},
+	}, true
 }
 
 // getChannelContentType returns the content type for a channel.
@@ -360,9 +443,10 @@ func buildCategoryList(sp *proxy.StreamProxy, contentType string) []xcCategory {
 // HandleXCPlayerAPI handles /player_api.php requests from Xtream Codes compatible clients.
 func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		username := r.URL.Query().Get("username")
-		password := r.URL.Query().Get("password")
-		action := r.URL.Query().Get("action")
+		query := r.URL.Query()
+		username := query.Get("username")
+		password := query.Get("password")
+		action := query.Get("action")
 
 		w.Header().Set("Content-Type", "application/json")
 
@@ -385,9 +469,6 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 			account.ActiveConns.Add(1)
 			defer account.ActiveConns.Add(-1)
 		}
-
-		serverInfo := buildXCServerInfo(sp.Config.BaseURL)
-		userInfo := buildXCUserInfo(account)
 
 		switch action {
 		case "get_live_categories":
@@ -418,6 +499,27 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 			}
 			json.NewEncoder(w).Encode(buildStreamList(sp, "vod", sp.Config.BaseURL, username, password))
 
+		case "get_vod_info":
+			if !account.EnableVOD {
+				json.NewEncoder(w).Encode(map[string]any{})
+				return
+			}
+			rawID := query.Get("vod_id")
+			if rawID == "" {
+				rawID = query.Get("stream_id")
+			}
+			streamID, err := strconv.Atoi(rawID)
+			if err != nil || streamID <= 0 {
+				json.NewEncoder(w).Encode(map[string]any{})
+				return
+			}
+			vodInfo, ok := buildVODInfo(sp, streamID, sp.Config.BaseURL, username, password)
+			if !ok {
+				json.NewEncoder(w).Encode(map[string]any{})
+				return
+			}
+			json.NewEncoder(w).Encode(vodInfo)
+
 		case "get_series_categories":
 			if !account.EnableSeries {
 				json.NewEncoder(w).Encode([]xcCategory{})
@@ -434,18 +536,18 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 
 		case "get_short_epg":
 			limit := 4
-			if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+			if l, err := strconv.Atoi(query.Get("limit")); err == nil && l > 0 {
 				limit = l
 			}
-			json.NewEncoder(w).Encode(buildXCEPGListings(sp, r.URL.Query().Get("stream_id"), limit, false))
+			json.NewEncoder(w).Encode(buildXCEPGListings(sp, query.Get("stream_id"), limit, false))
 
 		case "get_simple_data_table":
-			json.NewEncoder(w).Encode(buildXCEPGListings(sp, r.URL.Query().Get("stream_id"), 0, true))
+			json.NewEncoder(w).Encode(buildXCEPGListings(sp, query.Get("stream_id"), 0, true))
 
 		default:
 			json.NewEncoder(w).Encode(map[string]any{
-				"user_info":   userInfo,
-				"server_info": serverInfo,
+				"user_info":   buildXCUserInfo(account),
+				"server_info": buildXCServerInfo(sp.Config.BaseURL),
 			})
 		}
 
