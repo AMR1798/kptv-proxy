@@ -85,16 +85,15 @@ type SourceConfig struct {
 }
 
 // XCOutputAccount represents an Xtream Codes compatible output account.
-// ActiveConns is runtime-only and never persisted.
 type XCOutputAccount struct {
-	Name           string       `json:"name"`
-	Username       string       `json:"username"`
-	Password       string       `json:"password"`
-	MaxConnections int          `json:"maxConnections"`
-	EnableLive     bool         `json:"enableLive"`
-	EnableSeries   bool         `json:"enableSeries"`
-	EnableVOD      bool         `json:"enableVOD"`
-	ActiveConns    atomic.Int32 `json:"-"`
+	ID             int64  `json:"id"`
+	Name           string `json:"name"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	MaxConnections int    `json:"maxConnections"`
+	EnableLive     bool   `json:"enableLive"`
+	EnableSeries   bool   `json:"enableSeries"`
+	EnableVOD      bool   `json:"enableVOD"`
 }
 
 var (
@@ -441,6 +440,7 @@ func loadXCAccountsFromDB() ([]XCOutputAccount, error) {
 	accounts := make([]XCOutputAccount, 0, len(rows))
 	for _, r := range rows {
 		accounts = append(accounts, XCOutputAccount{
+			ID:             r.ID,
 			Name:           r.Name,
 			Username:       r.Username,
 			Password:       r.Password,

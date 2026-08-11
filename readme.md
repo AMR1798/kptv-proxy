@@ -157,7 +157,7 @@ Tokens support granular permission bitmasks:
 
 ### 📡 **Xtream Codes Output**
 
-- **XC-Compatible API**: Expose your aggregated streams via a full Xtream Codes compatible API
+- **XC-Compatible API**: Expose prioritized Xtream Codes authentication, catalog, detail, EPG, playlist, and playback flows
 - **Multi-Account Support**: Create multiple XC output accounts with independent credentials
 - **Per-Account Content Control**: Enable or disable Live, VOD, and Series per account
 - **Connection Limits**: Configurable maximum connections per account
@@ -265,6 +265,40 @@ Unified Playlist:        http://your-server-ip:PORT/pl/{username}/{password}
 Group Filtered Playlist: http://your-server-ip:PORT/pl/{username}/{password}/{group}
 XC API:                  http://your-server-ip:PORT/player_api.php
 ```
+
+### Xtream Codes Compatibility
+
+XC output accounts authenticate the public endpoints with their configured username and password. KPTV Proxy supports these `player_api.php` actions:
+
+| Action | Behavior |
+|--------|----------|
+| no action or unknown action | Returns the authenticated `user_info` and `server_info` blocks |
+| `get_live_categories` | Lists generated live category IDs |
+| `get_live_streams` | Lists live streams; optional `category_id` filters by a returned category ID |
+| `get_vod_categories` | Lists generated VOD category IDs |
+| `get_vod_streams` | Lists VOD items; optional `category_id` filters by a returned category ID |
+| `get_vod_info` | Returns provider VOD `info` and `movie_data` for a listed `vod_id`; missing optional provider metadata is returned with stable playback identity fields |
+| `get_series_categories` | Lists generated series category IDs |
+| `get_series` | Lists series; optional `category_id` filters by a returned category ID |
+| `get_series_info` | Returns provider series information, seasons, and episodes keyed by season for a listed `series_id`; episode IDs resolve on `/series/...` playback routes |
+| `get_short_epg` | Returns bounded EPG listings for a live `stream_id` |
+| `get_simple_data_table` | Returns the live stream's EPG table and marks the current programme |
+
+`category_id` is optional; an omitted value or `0` returns the full enabled catalog, while an unknown category returns an empty JSON array. Catalog and detail requests do not consume playback connections. `Max Connections` limits concurrent active playback sessions per account and is released when playback disconnects or setup terminates.
+
+`player_api.php` accepts query-string GET and `application/x-www-form-urlencoded` POST requests. Form fields override query fields; duplicate supported fields within either source are rejected. The public playlist and playback routes are:
+
+```text
+GET /get.php?username={username}&password={password}&type=m3u_plus
+GET /xmltv.php?username={username}&password={password}
+GET /live/{username}/{password}/{stream_id}.ts
+GET /movie/{username}/{password}/{stream_id}.{extension}
+GET /series/{username}/{password}/{episode_id}.{extension}
+```
+
+The account's Enable Live, Enable VOD, and Enable Series flags apply to catalogs, details, generated M3U entries, EPG access, and their corresponding direct playback routes. Invalid credentials return `401`; malformed detail IDs return `404`, malformed direct playback IDs return `400`, and unknown or cross-content IDs do not resolve.
+
+Credentials are URL-encoded component by component in generated URLs. Query credentials may contain reserved characters, but credentials containing `/` cannot be used reliably in direct path routes because Gorilla Mux decodes escaped slashes before route matching. Catch-up, timeshift, TV archive, and replay behavior are explicitly deferred and are not implemented.
 
 ## Docker Compose Examples
 

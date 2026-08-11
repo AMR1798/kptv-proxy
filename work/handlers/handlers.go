@@ -5,6 +5,8 @@ import (
 	"kptv-proxy/work/logger"
 	"kptv-proxy/work/middleware"
 	"kptv-proxy/work/proxy"
+	"kptv-proxy/work/types"
+	"kptv-proxy/work/utils"
 	"net/http"
 	"os"
 	"time"
@@ -20,7 +22,7 @@ func HandlePlaylist(sp *proxy.StreamProxy) http.HandlerFunc {
 		username := vars["username"]
 		password := vars["password"]
 
-		account := findXCAccount(sp.Config, username, password)
+		account := findXCAccount(sp, username, password)
 		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -42,7 +44,7 @@ func HandleGroupPlaylist(sp *proxy.StreamProxy) http.HandlerFunc {
 		password := vars["password"]
 		group := vars["group"]
 
-		account := findXCAccount(sp.Config, username, password)
+		account := findXCAccount(sp, username, password)
 		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -55,6 +57,33 @@ func HandleGroupPlaylist(sp *proxy.StreamProxy) http.HandlerFunc {
 	}
 }
 
+func authorizedLegacyChannel(channel *types.Channel, account *proxy.XCAccount) *types.Channel {
+	channel.Mu.RLock()
+	defer channel.Mu.RUnlock()
+	if len(channel.Streams) == 0 {
+		return nil
+	}
+	allowed := make([]*types.Stream, 0, len(channel.Streams))
+	for _, stream := range channel.Streams {
+		if accountAllowsContent(account, utils.ContentTypeOfStream(stream)) {
+			allowed = append(allowed, stream)
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	if len(allowed) == len(channel.Streams) {
+		return channel
+	}
+	return &types.Channel{Name: channel.Name, Streams: allowed, PreferredStreamIndex: channel.PreferredStreamIndex}
+}
+
+func legacyChannelContentType(channel *types.Channel) string {
+	channel.Mu.RLock()
+	defer channel.Mu.RUnlock()
+	return string(utils.ContentTypeOfStream(channel.Streams[0]))
+}
+
 // HandleStream returns an HTTP handler function that initiates streaming of a specific channel
 // to the requesting client.
 func HandleStream(sp *proxy.StreamProxy) http.HandlerFunc {
@@ -64,7 +93,8 @@ func HandleStream(sp *proxy.StreamProxy) http.HandlerFunc {
 		password := vars["password"]
 		safeName := vars["channel"]
 
-		if findXCAccount(sp.Config, username, password) == nil {
+		account := findXCAccount(sp, username, password)
+		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -76,9 +106,19 @@ func HandleStream(sp *proxy.StreamProxy) http.HandlerFunc {
 			http.Error(w, "Channel not found", http.StatusNotFound)
 			return
 		}
+		channel = authorizedLegacyChannel(channel, account)
+		if channel == nil {
+			http.Error(w, "Channel not found", http.StatusNotFound)
+			return
+		}
 
 		logger.Debug("{handlers - HandleStream} handling stream for channel: %s", channelName)
-		sp.HandleRestreamingClient(w, r, channel)
+		lease, ok := sp.AccountRegistry().Acquire(account, legacyChannelContentType(channel))
+		if !ok {
+			http.Error(w, "Connection limit reached", http.StatusTooManyRequests)
+			return
+		}
+		sp.HandleRestreamingClient(w, r, channel, lease)
 	}
 }
 
@@ -91,8 +131,13 @@ func HandleEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 		username := vars["username"]
 		password := vars["password"]
 
-		if findXCAccount(sp.Config, username, password) == nil {
+		account := findXCAccount(sp, username, password)
+		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !account.Config.EnableLive {
+			http.NotFound(w, r)
 			return
 		}
 
