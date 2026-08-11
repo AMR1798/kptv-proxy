@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"kptv-proxy/work/config"
+	"io"
 	"kptv-proxy/work/epgindex"
 	"kptv-proxy/work/logger"
+	"kptv-proxy/work/parser"
 	"kptv-proxy/work/proxy"
 	"kptv-proxy/work/types"
 	"kptv-proxy/work/utils"
+	"mime"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -94,6 +97,120 @@ type xcEPGListing struct {
 	HasArchive     int    `json:"has_archive"`
 }
 
+const (
+	maxXCFormBodyBytes = 64 << 10
+	maxXCEPGListings   = 1000
+)
+
+type xcRequestParameters struct {
+	username   string
+	password   string
+	action     string
+	categoryID string
+	vodID      string
+	seriesID   string
+	streamID   string
+	outputType string
+	limit      int
+}
+
+type xcRequestError struct {
+	status int
+}
+
+func (e *xcRequestError) Error() string {
+	return http.StatusText(e.status)
+}
+
+var xcSupportedParameters = []string{
+	"username", "password", "action", "category_id", "vod_id", "series_id", "stream_id", "type", "limit",
+}
+
+// normalizeXCRequestParameters applies one policy across XC query and form
+// requests: form values override query values, while duplicates within either
+// source are rejected as ambiguous.
+func normalizeXCRequestParameters(r *http.Request) (xcRequestParameters, error) {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return xcRequestParameters{}, &xcRequestError{status: http.StatusBadRequest}
+	}
+	if err := rejectDuplicateXCParameters(query); err != nil {
+		return xcRequestParameters{}, err
+	}
+
+	var form url.Values
+	if r.Method == http.MethodPost {
+		if r.ContentLength > maxXCFormBodyBytes {
+			return xcRequestParameters{}, &xcRequestError{status: http.StatusRequestEntityTooLarge}
+		}
+		if r.ContentLength != 0 || r.Header.Get("Content-Type") != "" {
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/x-www-form-urlencoded" {
+				return xcRequestParameters{}, &xcRequestError{status: http.StatusUnsupportedMediaType}
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, maxXCFormBodyBytes+1))
+			if err != nil {
+				return xcRequestParameters{}, &xcRequestError{status: http.StatusBadRequest}
+			}
+			if len(body) > maxXCFormBodyBytes {
+				return xcRequestParameters{}, &xcRequestError{status: http.StatusRequestEntityTooLarge}
+			}
+			form, err = url.ParseQuery(string(body))
+			if err != nil {
+				return xcRequestParameters{}, &xcRequestError{status: http.StatusBadRequest}
+			}
+			if err := rejectDuplicateXCParameters(form); err != nil {
+				return xcRequestParameters{}, err
+			}
+		}
+	}
+
+	value := func(key string) string {
+		if form != nil {
+			if values, ok := form[key]; ok {
+				return values[0]
+			}
+		}
+		return query.Get(key)
+	}
+	params := xcRequestParameters{
+		username:   value("username"),
+		password:   value("password"),
+		action:     value("action"),
+		categoryID: value("category_id"),
+		vodID:      value("vod_id"),
+		seriesID:   value("series_id"),
+		streamID:   value("stream_id"),
+		outputType: value("type"),
+		limit:      4,
+	}
+	if rawLimit := value("limit"); rawLimit != "" {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit < 1 || limit > maxXCEPGListings {
+			return xcRequestParameters{}, &xcRequestError{status: http.StatusBadRequest}
+		}
+		params.limit = limit
+	}
+	return params, nil
+}
+
+func rejectDuplicateXCParameters(values url.Values) error {
+	for _, key := range xcSupportedParameters {
+		if len(values[key]) > 1 {
+			return &xcRequestError{status: http.StatusBadRequest}
+		}
+	}
+	return nil
+}
+
+func writeXCRequestError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if requestErr, ok := err.(*xcRequestError); ok {
+		status = requestErr.status
+	}
+	http.Error(w, "Invalid XC request", status)
+}
+
 // getSortedChannels snapshots the channel map and returns it sorted alphabetically
 // by channel name. All XC output functions must use this instead of ranging the
 // map directly to guarantee consistent ordering across every response.
@@ -146,18 +263,6 @@ func xcChannelOriginalOrder(ch *types.Channel) (int, int) {
 	return sourceOrder, importOrder
 }
 
-// streamIDFromName generates a stable positive integer stream ID from a channel name
-// using FNV32a hashing to produce consistent IDs across restarts.
-func streamIDFromName(name string) int {
-	h := fnv.New32a()
-	h.Write([]byte(name))
-	id := int(h.Sum32() & 0x7FFFFFFF)
-	if id == 0 {
-		id = 1
-	}
-	return id
-}
-
 // categoryIDFromName generates a stable string category ID from a group name.
 func categoryIDFromName(name string) string {
 	h := fnv.New32a()
@@ -180,31 +285,17 @@ func buildXCStreamURL(baseURL, contentType, username, password string, streamID 
 		pathType = "series"
 		suffix = utils.NormalizeContainerExtension(extension)
 	}
-	return fmt.Sprintf("%s/%s/%s/%s/%d.%s", baseURL, pathType, username, password, streamID, suffix)
+	streamURL, err := utils.AppendURLPath(baseURL, pathType, username, password, fmt.Sprintf("%d.%s", streamID, suffix))
+	if err != nil {
+		return ""
+	}
+	return streamURL
 }
 
 // findXCAccount locates an XC output account by username and password.
-func findXCAccount(cfg *config.Config, username, password string) *config.XCOutputAccount {
-	for i := range cfg.XCOutputAccounts {
-		acc := &cfg.XCOutputAccounts[i]
-		if acc.Username == username && acc.Password == password {
-			return acc
-		}
-	}
-	return nil
-}
-
-// findChannelByStreamID locates a channel name by its hashed stream ID.
-func findChannelByStreamID(sp *proxy.StreamProxy, id int) string {
-	var found string
-	sp.Channels.Range(func(name string, _ *types.Channel) bool {
-		if streamIDFromName(name) == id {
-			found = name
-			return false
-		}
-		return true
-	})
-	return found
+func findXCAccount(sp *proxy.StreamProxy, username, password string) *proxy.XCAccount {
+	account, _ := sp.AccountRegistry().Authenticate(username, password)
+	return account
 }
 
 // getChannelContentType returns the content type for a channel.
@@ -248,66 +339,59 @@ func buildXCServerInfo(baseURL string) xcServerInfo {
 }
 
 // buildXCUserInfo constructs the user_info block for an XC output account.
-func buildXCUserInfo(account *config.XCOutputAccount) xcUserInfo {
+func buildXCUserInfo(account *proxy.XCAccount) xcUserInfo {
 	return xcUserInfo{
-		Username:             account.Username,
-		Password:             account.Password,
+		Username:             account.Config.Username,
+		Password:             account.Config.Password,
 		Message:              "",
 		Auth:                 1,
 		Status:               "Active",
 		ExpDate:              nil,
 		IsTrial:              "0",
-		ActiveCons:           fmt.Sprintf("%d", account.ActiveConns.Load()),
+		ActiveCons:           fmt.Sprintf("%d", account.ActiveConnections()),
 		CreatedAt:            "0",
-		MaxConnections:       fmt.Sprintf("%d", account.MaxConnections),
+		MaxConnections:       fmt.Sprintf("%d", account.Config.MaxConnections),
 		AllowedOutputFormats: []string{"ts", "m3u8"},
 	}
 }
 
 // buildStreamList iterates sorted channels and builds the XC stream list for a
 // given content type. Channels are always ordered alphabetically by name.
-func buildStreamList(sp *proxy.StreamProxy, contentType, baseURL, username, password string) []xcStream {
-	var streams []xcStream
+func buildStreamList(sp *proxy.StreamProxy, contentType, baseURL, username, password, categoryID string) []xcStream {
+	streams := make([]xcStream, 0)
 	num := 1
 
 	// channel-name -> mapped epg_id; unmapped channels fall back to the dummy id
 	epgMap := proxy.ChannelEPGMap()
 
-	for _, item := range getSortedChannels(sp) {
-		item.channel.Mu.RLock()
-
-		if len(item.channel.Streams) == 0 {
-			item.channel.Mu.RUnlock()
-			continue
-		}
-
-		chType := getChannelContentType(item.channel)
-		if chType != contentType {
-			item.channel.Mu.RUnlock()
-			continue
-		}
-
-		stream := item.channel.Streams[0]
+	for _, record := range getSortedXCRecords(sp, types.ContentType(contentType)) {
+		stream := record.Stream
 		attrs := stream.Attributes
 		extension := utils.NormalizeContainerExtension(stream.ContainerExtension)
-		item.channel.Mu.RUnlock()
 
-		streamID := streamIDFromName(item.name)
+		streamID := record.Identity.OutputID
 		group := attrs["group-title"]
+		generatedCategoryID := categoryIDFromName(group)
+		if categoryID != "" && categoryID != "0" && categoryID != generatedCategoryID {
+			continue
+		}
 		logo := attrs["tvg-logo"]
-		tvgID := proxy.EPGIDForChannel(item.name, epgMap)
+		tvgID := proxy.EPGIDForChannel(record.Name, epgMap)
 
-		directURL := buildXCStreamURL(baseURL, contentType, username, password, streamID, extension)
+		directURL := ""
+		if contentType != string(types.ContentTypeSeries) {
+			directURL = buildXCStreamURL(baseURL, contentType, username, password, streamID, extension)
+		}
 
 		s := xcStream{
 			Num:               num,
-			Name:              item.name,
+			Name:              record.Name,
 			StreamType:        contentType,
 			StreamID:          streamID,
 			StreamIcon:        logo,
 			EPGChannelID:      tvgID,
 			Added:             "0",
-			CategoryID:        categoryIDFromName(group),
+			CategoryID:        generatedCategoryID,
 			CustomSid:         "",
 			TVArchive:         0,
 			DirectSource:      directURL,
@@ -328,21 +412,11 @@ func buildStreamList(sp *proxy.StreamProxy, contentType, baseURL, username, pass
 // given content type. Category order follows first-seen in alphabetical channel order.
 func buildCategoryList(sp *proxy.StreamProxy, contentType string) []xcCategory {
 	seen := make(map[string]bool)
-	var categories []xcCategory
+	categories := make([]xcCategory, 0)
 
-	for _, item := range getSortedChannels(sp) {
-		item.channel.Mu.RLock()
-
-		if len(item.channel.Streams) == 0 {
-			item.channel.Mu.RUnlock()
-			continue
-		}
-
-		chType := getChannelContentType(item.channel)
-		group := item.channel.Streams[0].Attributes["group-title"]
-		item.channel.Mu.RUnlock()
-
-		if chType != contentType || group == "" || seen[group] {
+	for _, record := range getSortedXCRecords(sp, types.ContentType(contentType)) {
+		group := record.Stream.Attributes["group-title"]
+		if group == "" || seen[group] {
 			continue
 		}
 
@@ -357,18 +431,134 @@ func buildCategoryList(sp *proxy.StreamProxy, contentType string) []xcCategory {
 	return categories
 }
 
+func getSortedXCRecords(sp *proxy.StreamProxy, contentType types.ContentType) []*types.XCRecord {
+	records := make([]*types.XCRecord, 0)
+	for _, record := range sp.XCSnapshot().Records {
+		if contentType == types.ContentTypeUnknown || record.Identity.ContentType == contentType {
+			records = append(records, record)
+		}
+	}
+	if sp.Config.SortField == "preserve-order" {
+		sort.SliceStable(records, func(i, j int) bool {
+			return xcChannelOriginalOrderLess(
+				xcChannelBatch{records[i].Name, records[i].Channel},
+				xcChannelBatch{records[j].Name, records[j].Channel},
+			)
+		})
+	} else {
+		sort.SliceStable(records, func(i, j int) bool {
+			return strings.ToLower(records[i].Name) < strings.ToLower(records[j].Name)
+		})
+	}
+	return records
+}
+
+func findXCDetailRecord(snapshot *types.XCCatalogSnapshot, contentType types.ContentType, rawID string) *types.XCRecord {
+	id, err := strconv.Atoi(rawID)
+	if err != nil || id < 1 {
+		return nil
+	}
+	return snapshot.Lookup(contentType, id)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func xcDetailCacheGeneration(account *proxy.XCAccount, catalog uint64) string {
+	return fmt.Sprintf("account:%d:auth:%d:catalog:%d", account.Config.ID, account.Generation, catalog)
+}
+
+func prepareXCSeriesEpisodes(sp *proxy.StreamProxy, generation *types.XCCatalogSnapshot, series *types.XCRecord, detail *parser.XCSeriesDetail) {
+	if detail.Info == nil {
+		detail.Info = parser.XCMetadata{}
+	}
+	if detail.Seasons == nil {
+		detail.Seasons = []parser.XCSeriesSeason{}
+	}
+	if detail.Episodes == nil {
+		detail.Episodes = map[string][]parser.XCSeriesEpisode{}
+		return
+	}
+	for season, episodes := range detail.Episodes {
+		valid := make([]parser.XCSeriesEpisode, 0, len(episodes))
+		for _, episode := range episodes {
+			providerID := string(episode.ID)
+			outputID := proxy.XCEpisodeOutputID(series.Identity.ProviderSource, series.Identity.ProviderID, providerID)
+			extension := utils.NormalizeContainerExtension(episode.ContainerExtension)
+			episode.ContainerExtension = extension
+			streamURL, err := utils.AppendURLPath(series.Stream.Source.URL, "series", series.Stream.Source.Username, series.Stream.Source.Password, providerID+"."+extension)
+			if err != nil {
+				continue
+			}
+			name := firstNonEmpty(episode.Title, series.Name+" episode "+string(episode.EpisodeNum))
+			stream := &types.Stream{
+				URL: streamURL, Name: name, Source: series.Stream.Source,
+				ContentType: types.ContentTypeEpisode, ProviderID: providerID,
+				ProviderSource: series.Identity.ProviderSource, ContainerExtension: extension,
+				Attributes: map[string]string{"group-title": series.Stream.Attributes["group-title"]},
+			}
+			channel := &types.Channel{Name: series.Name + " - " + name, Streams: []*types.Stream{stream}}
+			record := &types.XCRecord{
+				Identity: types.XCIdentity{ContentType: types.ContentTypeEpisode, ProviderID: providerID, ProviderSource: series.Identity.ProviderSource, ProviderSeriesID: series.Identity.ProviderID, OutputID: outputID},
+				Name:     name, Channel: channel, Stream: stream,
+			}
+			if err := sp.RegisterXCEpisode(generation, record); err != nil {
+				logger.Error("{handlers/xcoutput - prepareXCSeriesEpisodes} Failed to register episode: %v", err)
+				continue
+			}
+			episode.ID = parser.XCID(strconv.Itoa(outputID))
+			valid = append(valid, episode)
+		}
+		detail.Episodes[season] = valid
+	}
+}
+
+func accountAllowsContent(account *proxy.XCAccount, contentType types.ContentType) bool {
+	return account.Allows(string(contentType))
+}
+
+func typedPlaybackChannel(record *types.XCRecord) *types.Channel {
+	channel := record.Channel
+	channel.Mu.RLock()
+	defer channel.Mu.RUnlock()
+	matching := make([]*types.Stream, 0, len(channel.Streams))
+	for _, stream := range channel.Streams {
+		if utils.ContentTypeOfStream(stream) == record.Identity.ContentType {
+			matching = append(matching, stream)
+		}
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+	if len(matching) == len(channel.Streams) {
+		return channel
+	}
+	return &types.Channel{Name: channel.Name, Streams: matching, PreferredStreamIndex: channel.PreferredStreamIndex}
+}
+
 // HandleXCPlayerAPI handles /player_api.php requests from Xtream Codes compatible clients.
 func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		username := r.URL.Query().Get("username")
-		password := r.URL.Query().Get("password")
-		action := r.URL.Query().Get("action")
+		params, err := normalizeXCRequestParameters(r)
+		if err != nil {
+			writeXCRequestError(w, err)
+			return
+		}
+		username := params.username
+		password := params.password
+		action := params.action
 
 		w.Header().Set("Content-Type", "application/json")
 
-		account := findXCAccount(sp.Config, username, password)
+		account := findXCAccount(sp, username, password)
 		if account == nil {
-			logger.Debug("{handlers/xcoutput - HandleXCPlayerAPI} Invalid credentials for username: %s", username)
+			logger.Debug("{handlers/xcoutput - HandleXCPlayerAPI} Invalid XC credentials")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]any{
 				"user_info": xcUserInfo{Auth: 0, Message: "Invalid credentials"},
@@ -376,71 +566,120 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 			return
 		}
 
-		if action != "" {
-			if account.ActiveConns.Load() >= int32(account.MaxConnections) {
-				logger.Warn("{handlers/xcoutput - HandleXCPlayerAPI} Account %s at connection limit (%d)", account.Name, account.MaxConnections)
-				http.Error(w, "Connection limit reached", http.StatusTooManyRequests)
-				return
-			}
-			account.ActiveConns.Add(1)
-			defer account.ActiveConns.Add(-1)
-		}
-
 		serverInfo := buildXCServerInfo(sp.Config.BaseURL)
 		userInfo := buildXCUserInfo(account)
 
 		switch action {
 		case "get_live_categories":
-			if !account.EnableLive {
+			if !account.Config.EnableLive {
 				json.NewEncoder(w).Encode([]xcCategory{})
 				return
 			}
 			json.NewEncoder(w).Encode(buildCategoryList(sp, "live"))
 
 		case "get_live_streams":
-			if !account.EnableLive {
+			if !account.Config.EnableLive {
 				json.NewEncoder(w).Encode([]xcStream{})
 				return
 			}
-			json.NewEncoder(w).Encode(buildStreamList(sp, "live", sp.Config.BaseURL, username, password))
+			json.NewEncoder(w).Encode(buildStreamList(sp, "live", sp.Config.BaseURL, username, password, params.categoryID))
 
 		case "get_vod_categories":
-			if !account.EnableVOD {
+			if !account.Config.EnableVOD {
 				json.NewEncoder(w).Encode([]xcCategory{})
 				return
 			}
 			json.NewEncoder(w).Encode(buildCategoryList(sp, "vod"))
 
 		case "get_vod_streams":
-			if !account.EnableVOD {
+			if !account.Config.EnableVOD {
 				json.NewEncoder(w).Encode([]xcStream{})
 				return
 			}
-			json.NewEncoder(w).Encode(buildStreamList(sp, "vod", sp.Config.BaseURL, username, password))
+			json.NewEncoder(w).Encode(buildStreamList(sp, "vod", sp.Config.BaseURL, username, password, params.categoryID))
+
+		case "get_vod_info":
+			if !account.Config.EnableVOD {
+				http.NotFound(w, r)
+				return
+			}
+			generation := sp.XCSnapshot()
+			record := findXCDetailRecord(generation, types.ContentTypeVOD, params.vodID)
+			if record == nil || record.Stream.Source == nil {
+				http.NotFound(w, r)
+				return
+			}
+			detail, err := parser.FetchXCVODDetail(r.Context(), sp.HttpClient, sp.Config, record.Stream.Source, sp.Cache, xcDetailCacheGeneration(account, generation.Generation), record.Identity.ProviderID)
+			if err != nil {
+				logger.Error("{handlers/xcoutput - HandleXCPlayerAPI} VOD detail fetch failed: %v", err)
+				http.Error(w, "VOD detail unavailable", http.StatusBadGateway)
+				return
+			}
+			if generation != sp.XCSnapshot() || !sp.AccountRegistry().IsCurrent(account) {
+				http.Error(w, "Catalog refreshed; retry detail request", http.StatusServiceUnavailable)
+				return
+			}
+			if detail.Info == nil {
+				detail.Info = parser.XCMetadata{}
+			}
+			detail.MovieData.StreamID = parser.XCID(strconv.Itoa(record.Identity.OutputID))
+			if detail.MovieData.Name == "" {
+				detail.MovieData.Name = record.Name
+			}
+			detail.MovieData.ContainerExtension = utils.NormalizeContainerExtension(firstNonEmpty(detail.MovieData.ContainerExtension, record.Stream.ContainerExtension))
+			json.NewEncoder(w).Encode(detail)
 
 		case "get_series_categories":
-			if !account.EnableSeries {
+			if !account.Config.EnableSeries {
 				json.NewEncoder(w).Encode([]xcCategory{})
 				return
 			}
 			json.NewEncoder(w).Encode(buildCategoryList(sp, "series"))
 
 		case "get_series":
-			if !account.EnableSeries {
+			if !account.Config.EnableSeries {
 				json.NewEncoder(w).Encode([]xcStream{})
 				return
 			}
-			json.NewEncoder(w).Encode(buildStreamList(sp, "series", sp.Config.BaseURL, username, password))
+			json.NewEncoder(w).Encode(buildStreamList(sp, "series", sp.Config.BaseURL, username, password, params.categoryID))
+
+		case "get_series_info":
+			if !account.Config.EnableSeries {
+				http.NotFound(w, r)
+				return
+			}
+			generation := sp.XCSnapshot()
+			record := findXCDetailRecord(generation, types.ContentTypeSeries, params.seriesID)
+			if record == nil || record.Stream.Source == nil {
+				http.NotFound(w, r)
+				return
+			}
+			detail, err := parser.FetchXCSeriesDetail(r.Context(), sp.HttpClient, sp.Config, record.Stream.Source, sp.Cache, xcDetailCacheGeneration(account, generation.Generation), record.Identity.ProviderID)
+			if err != nil {
+				logger.Error("{handlers/xcoutput - HandleXCPlayerAPI} Series detail fetch failed: %v", err)
+				http.Error(w, "Series detail unavailable", http.StatusBadGateway)
+				return
+			}
+			if generation != sp.XCSnapshot() || !sp.AccountRegistry().IsCurrent(account) {
+				http.Error(w, "Catalog refreshed; retry detail request", http.StatusServiceUnavailable)
+				return
+			}
+			prepareXCSeriesEpisodes(sp, generation, record, &detail)
+			json.NewEncoder(w).Encode(detail)
 
 		case "get_short_epg":
-			limit := 4
-			if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
-				limit = l
+			if !account.Config.EnableLive {
+				json.NewEncoder(w).Encode(map[string]any{"epg_listings": []xcEPGListing{}})
+				return
 			}
-			json.NewEncoder(w).Encode(buildXCEPGListings(sp, r.URL.Query().Get("stream_id"), limit, false))
+			json.NewEncoder(w).Encode(buildXCEPGListings(sp, params.streamID, params.limit, false))
 
 		case "get_simple_data_table":
-			json.NewEncoder(w).Encode(buildXCEPGListings(sp, r.URL.Query().Get("stream_id"), 0, true))
+			if !account.Config.EnableLive {
+				json.NewEncoder(w).Encode(map[string]any{"epg_listings": []xcEPGListing{}})
+				return
+			}
+			json.NewEncoder(w).Encode(buildXCEPGListings(sp, params.streamID, 0, true))
 
 		default:
 			json.NewEncoder(w).Encode(map[string]any{
@@ -449,18 +688,23 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 			})
 		}
 
-		logger.Debug("{handlers/xcoutput - HandleXCPlayerAPI} Handled action '%s' for account: %s", action, account.Name)
+		logger.Debug("{handlers/xcoutput - HandleXCPlayerAPI} Handled action '%s' for account: %s", action, account.Config.Name)
 	}
 }
 
 // HandleXCGetPHP handles /get.php requests, returning a sorted M3U playlist.
 func HandleXCGetPHP(sp *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		username := r.URL.Query().Get("username")
-		password := r.URL.Query().Get("password")
-		outputType := r.URL.Query().Get("type")
+		params, err := normalizeXCRequestParameters(r)
+		if err != nil {
+			writeXCRequestError(w, err)
+			return
+		}
+		username := params.username
+		password := params.password
+		outputType := params.outputType
 
-		account := findXCAccount(sp.Config, username, password)
+		account := findXCAccount(sp, username, password)
 		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -485,7 +729,7 @@ func HandleXCStream(sp *proxy.StreamProxy) http.HandlerFunc {
 		password := vars["password"]
 		rawID := vars["id"]
 
-		account := findXCAccount(sp.Config, username, password)
+		account := findXCAccount(sp, username, password)
 		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -502,60 +746,71 @@ func HandleXCStream(sp *proxy.StreamProxy) http.HandlerFunc {
 			return
 		}
 
-		channelName := findChannelByStreamID(sp, streamID)
-		if channelName == "" {
+		contentType := types.ContentTypeLive
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/movie/"):
+			contentType = types.ContentTypeVOD
+		case strings.HasPrefix(r.URL.Path, "/series/"):
+			contentType = types.ContentTypeEpisode
+		}
+		if !accountAllowsContent(account, contentType) {
 			http.Error(w, "Stream not found", http.StatusNotFound)
 			return
 		}
-
-		channel, exists := sp.Channels.Load(channelName)
-		if !exists {
+		record := sp.LookupXCRecord(contentType, streamID)
+		if record == nil {
+			http.Error(w, "Stream not found", http.StatusNotFound)
+			return
+		}
+		channel := typedPlaybackChannel(record)
+		if channel == nil {
 			http.Error(w, "Stream not found", http.StatusNotFound)
 			return
 		}
 
 		logger.Debug("{handlers/xcoutput - HandleXCStream} XC stream: account=%s, id=%d, channel=%s",
-			account.Name, streamID, channelName)
+			account.Config.Name, streamID, record.Name)
 
-		sp.HandleRestreamingClient(w, r, channel)
+		lease, ok := sp.AccountRegistry().Acquire(account, string(contentType))
+		if !ok {
+			http.Error(w, "Connection limit reached", http.StatusTooManyRequests)
+			return
+		}
+		sp.HandleRestreamingClient(w, r, channel, lease)
 	}
 }
 
 // writeXCM3UPlaylist writes a sorted M3U playlist filtered by account content settings.
-func writeXCM3UPlaylist(w http.ResponseWriter, sp *proxy.StreamProxy, account *config.XCOutputAccount) {
+func writeXCM3UPlaylist(w http.ResponseWriter, sp *proxy.StreamProxy, account *proxy.XCAccount) {
 	fmt.Fprintf(w, "#EXTM3U\n")
 
 	// channel-name -> mapped epg_id; unmapped channels fall back to the dummy id
 	epgMap := proxy.ChannelEPGMap()
 
-	for _, item := range getSortedChannels(sp) {
-		item.channel.Mu.RLock()
-
-		if len(item.channel.Streams) == 0 {
-			item.channel.Mu.RUnlock()
-			continue
-		}
-
-		contentType := getChannelContentType(item.channel)
-		stream := item.channel.Streams[0]
+	for _, record := range getSortedXCRecords(sp, types.ContentTypeUnknown) {
+		contentType := string(record.Identity.ContentType)
+		stream := record.Stream
 		attrs := stream.Attributes
 		extension := utils.NormalizeContainerExtension(stream.ContainerExtension)
-		item.channel.Mu.RUnlock()
 
-		if contentType == "live" && !account.EnableLive {
+		if contentType == "live" && !account.Config.EnableLive {
 			continue
 		}
-		if contentType == "vod" && !account.EnableVOD {
+		if contentType == "vod" && !account.Config.EnableVOD {
 			continue
 		}
-		if contentType == "series" && !account.EnableSeries {
+		if contentType == "series" && !account.Config.EnableSeries {
+			continue
+		}
+		if contentType == "series" {
+			// Series parents are metadata records; only episode IDs are playable.
 			continue
 		}
 
-		streamID := streamIDFromName(item.name)
+		streamID := record.Identity.OutputID
 		logo := attrs["tvg-logo"]
 		group := attrs["group-title"]
-		tvgID := proxy.EPGIDForChannel(item.name, epgMap)
+		tvgID := proxy.EPGIDForChannel(record.Name, epgMap)
 
 		// mapped channels advertise the raw mapped epg id on all three
 		// guide-matching attributes; unmapped fall back to the dummy id
@@ -564,26 +819,35 @@ func writeXCM3UPlaylist(w http.ResponseWriter, sp *proxy.StreamProxy, account *c
 			epgAttrs = fmt.Sprintf(" tvg-id=\"%s\" tvg-epgid=\"%s\" tvc-guide-stationid=\"%s\"", tvgID, tvgID, tvgID)
 		}
 
-		displayName := utils.SanitizeM3UDisplayName(item.name)
+		displayName := utils.SanitizeM3UDisplayName(record.Name)
 		fmt.Fprintf(w, "#EXTINF:-1%s tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"%s\",%s\n",
 			epgAttrs, utils.EscapeM3UAttribute(displayName), utils.EscapeM3UAttribute(logo), utils.EscapeM3UAttribute(group), displayName)
-		fmt.Fprintln(w, buildXCStreamURL(sp.Config.BaseURL, contentType, account.Username, account.Password, streamID, extension))
+		fmt.Fprintln(w, buildXCStreamURL(sp.Config.BaseURL, contentType, account.Config.Username, account.Config.Password, streamID, extension))
 	}
 }
 
 // HandleXCXMLTV handles /xmltv.php requests, delegating to the EPG handler.
 func HandleXCXMLTV(sp *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		username := r.URL.Query().Get("username")
-		password := r.URL.Query().Get("password")
+		params, err := normalizeXCRequestParameters(r)
+		if err != nil {
+			writeXCRequestError(w, err)
+			return
+		}
+		username := params.username
+		password := params.password
 
-		account := findXCAccount(sp.Config, username, password)
+		account := findXCAccount(sp, username, password)
 		if account == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if !account.Config.EnableLive {
+			http.NotFound(w, r)
+			return
+		}
 
-		logger.Debug("{handlers/xcoutput - HandleXCXMLTV} EPG request for account: %s", account.Name)
+		logger.Debug("{handlers/xcoutput - HandleXCXMLTV} EPG request for account: %s", account.Config.Name)
 		serveEPG(sp)(w, r)
 	}
 }
@@ -598,12 +862,12 @@ func buildXCEPGListings(sp *proxy.StreamProxy, streamIDStr string, limit int, ma
 		return empty
 	}
 
-	channelName := findChannelByStreamID(sp, streamID)
-	if channelName == "" {
+	record := sp.LookupXCRecord(types.ContentTypeLive, streamID)
+	if record == nil {
 		return empty
 	}
 
-	tvgID := proxy.EPGIDForChannel(channelName, proxy.ChannelEPGMap())
+	tvgID := proxy.EPGIDForChannel(record.Name, proxy.ChannelEPGMap())
 
 	now := time.Now()
 	progs := epgindex.Programmes(tvgID, now, limit)

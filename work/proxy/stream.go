@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"hash/fnv"
 	"kptv-proxy/work/buffer"
 	"kptv-proxy/work/cache"
 	"kptv-proxy/work/client"
@@ -42,18 +43,71 @@ var (
 // generation, client connection handling, restreaming, and background maintenance
 // tasks across all configured sources and channels.
 type StreamProxy struct {
-	Config                *config.Config                       // application configuration
-	Channels              *xsync.MapOf[string, *types.Channel] // concurrent map of all discovered channels keyed by name
-	Cache                 *cache.Cache                         // shared cache instance for playlists, EPG, and stream data
-	BufferPool            *buffer.BufferPool                   // pooled byte buffers for efficient memory reuse during streaming
-	HttpClient            *client.HeaderSettingClient          // pre-configured HTTP client with custom header injection
-	WorkerPool            *ants.Pool                           // bounded goroutine pool for controlled concurrency
-	MasterPlaylistHandler *parser.MasterPlaylistHandler        // HLS master playlist detection and resolution handler
-	importStopChan        chan bool                            // signal channel to gracefully terminate the import refresh loop
-	WatcherManager        *watcher.WatcherManager              // manages stream quality watchers for active restreaming sessions
-	SourceRateLimiters    map[string]ratelimit.Limiter         // per-source rate limiters keyed by source URL
-	rateLimiterMutex      sync.RWMutex                         // protects concurrent access to the rate limiter map
-	FilterManager         *filter.FilterManager                // handles stream filtering rules from configuration
+	Config                *config.Config                // application configuration
+	Channels              *ChannelStore                 // atomically published channel and XC catalog generation
+	Cache                 *cache.Cache                  // shared cache instance for playlists, EPG, and stream data
+	BufferPool            *buffer.BufferPool            // pooled byte buffers for efficient memory reuse during streaming
+	HttpClient            *client.HeaderSettingClient   // pre-configured HTTP client with custom header injection
+	WorkerPool            *ants.Pool                    // bounded goroutine pool for controlled concurrency
+	MasterPlaylistHandler *parser.MasterPlaylistHandler // HLS master playlist detection and resolution handler
+	importStopChan        chan bool                     // signal channel to gracefully terminate the import refresh loop
+	WatcherManager        *watcher.WatcherManager       // manages stream quality watchers for active restreaming sessions
+	SourceRateLimiters    map[string]ratelimit.Limiter  // per-source rate limiters keyed by source URL
+	rateLimiterMutex      sync.RWMutex                  // protects concurrent access to the rate limiter map
+	FilterManager         *filter.FilterManager         // handles stream filtering rules from configuration
+	XCAccounts            *XCAccountRegistry            // stable XC account identity and playback leases
+	xcAccountsMutex       sync.Mutex
+	xcEpisodeMutex        sync.RWMutex
+	xcEpisodeGeneration   *types.XCCatalogSnapshot
+	xcEpisodes            map[int]*types.XCRecord
+}
+
+func (sp *StreamProxy) AccountRegistry() *XCAccountRegistry {
+	sp.xcAccountsMutex.Lock()
+	defer sp.xcAccountsMutex.Unlock()
+	if sp.XCAccounts == nil {
+		sp.XCAccounts = NewXCAccountRegistry(sp.Config.XCOutputAccounts)
+	}
+	return sp.XCAccounts
+}
+
+type channelGeneration struct {
+	channels *xsync.MapOf[string, *types.Channel]
+	xc       *types.XCCatalogSnapshot
+}
+
+// ChannelStore preserves the existing concurrent-map API while allowing a
+// completed channel generation and its XC index to be replaced together.
+type ChannelStore struct {
+	current atomic.Pointer[channelGeneration]
+}
+
+func newChannelStore() *ChannelStore {
+	store := &ChannelStore{}
+	empty, _ := types.NewXCCatalogSnapshot(nil)
+	store.current.Store(&channelGeneration{channels: xsync.NewMapOf[string, *types.Channel](), xc: empty})
+	return store
+}
+
+func (s *ChannelStore) Load(name string) (*types.Channel, bool) {
+	return s.current.Load().channels.Load(name)
+}
+
+func (s *ChannelStore) Range(fn func(string, *types.Channel) bool) {
+	s.current.Load().channels.Range(fn)
+}
+
+func (s *ChannelStore) Clear() {
+	empty, _ := types.NewXCCatalogSnapshot(nil)
+	s.replace(xsync.NewMapOf[string, *types.Channel](), empty)
+}
+
+func (s *ChannelStore) replace(channels *xsync.MapOf[string, *types.Channel], xc *types.XCCatalogSnapshot) {
+	s.current.Store(&channelGeneration{channels: channels, xc: xc})
+}
+
+func (s *ChannelStore) xcSnapshot() *types.XCCatalogSnapshot {
+	return s.current.Load().xc
 }
 
 // New creates and initializes a new StreamProxy instance with all required dependencies.
@@ -65,7 +119,7 @@ func New(cfg *config.Config, bufferPool *buffer.BufferPool, httpClient *client.H
 
 	sp := &StreamProxy{
 		Config:                cfg,
-		Channels:              xsync.NewMapOf[string, *types.Channel](),
+		Channels:              newChannelStore(),
 		Cache:                 cacheInstance,
 		BufferPool:            bufferPool,
 		HttpClient:            httpClient,
@@ -76,6 +130,8 @@ func New(cfg *config.Config, bufferPool *buffer.BufferPool, httpClient *client.H
 		SourceRateLimiters:    make(map[string]ratelimit.Limiter),
 		rateLimiterMutex:      sync.RWMutex{},
 		FilterManager:         filter.NewFilterManager(),
+		XCAccounts:            NewXCAccountRegistry(cfg.XCOutputAccounts),
+		xcEpisodes:            make(map[int]*types.XCRecord),
 	}
 
 	// initialize all rate limiters upfront to avoid lazy creation during imports
@@ -129,6 +185,131 @@ func (sp *StreamProxy) ReinitRateLimiters() {
 type channelBatch struct {
 	name    string         // channel name as stored in the map key
 	channel *types.Channel // pointer to the channel data
+}
+
+// XCOutputID preserves the legacy positive name-hash IDs used by XC clients.
+func XCOutputID(name string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	id := int(h.Sum32() & 0x7FFFFFFF)
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
+// XCEpisodeOutputID derives a deterministic public ID from the complete
+// provider identity. The provider episode ID itself remains opaque and is
+// retained separately for upstream playback.
+func XCEpisodeOutputID(providerSource, providerSeriesID, providerEpisodeID string) int {
+	h := fnv.New32a()
+	for _, value := range []string{string(types.ContentTypeEpisode), providerSource, providerSeriesID, providerEpisodeID} {
+		_, _ = fmt.Fprintf(h, "%d:", len(value))
+		_, _ = h.Write([]byte(value))
+	}
+	id := int(h.Sum32() & 0x7FFFFFFF)
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
+// BuildXCSnapshot builds a complete typed lookup from a channel generation.
+func BuildXCSnapshot(channels []*types.Channel) (*types.XCCatalogSnapshot, error) {
+	return buildXCSnapshotWithIDs(channels, XCOutputID)
+}
+
+func buildXCSnapshotWithIDs(channels []*types.Channel, outputID func(string) int) (*types.XCCatalogSnapshot, error) {
+	sort.SliceStable(channels, func(i, j int) bool {
+		return strings.ToLower(channels[i].Name) < strings.ToLower(channels[j].Name)
+	})
+	records := make([]*types.XCRecord, 0, len(channels))
+	for _, channel := range channels {
+		canonical := make(map[types.ContentType]*types.Stream, 3)
+		channel.Mu.RLock()
+		for _, stream := range channel.Streams {
+			contentType := stream.ContentType
+			switch contentType {
+			case types.ContentTypeLive, types.ContentTypeVOD, types.ContentTypeSeries, types.ContentTypeEpisode:
+			default:
+				contentType = utils.ContentTypeOfStream(stream)
+			}
+			if canonical[contentType] == nil {
+				canonical[contentType] = stream
+			}
+		}
+		channel.Mu.RUnlock()
+
+		for _, contentType := range []types.ContentType{types.ContentTypeLive, types.ContentTypeVOD, types.ContentTypeSeries, types.ContentTypeEpisode} {
+			stream := canonical[contentType]
+			if stream == nil {
+				continue
+			}
+			providerSource := stream.ProviderSource
+			if providerSource == "" && stream.Source != nil {
+				providerSource = stream.Source.URL
+			}
+			records = append(records, &types.XCRecord{
+				Identity: types.XCIdentity{
+					ContentType:    contentType,
+					ProviderID:     stream.ProviderID,
+					ProviderSource: providerSource,
+					OutputID:       outputID(channel.Name),
+				},
+				Name: channel.Name, Channel: channel, Stream: stream,
+			})
+		}
+	}
+	return types.NewXCCatalogSnapshot(records)
+}
+
+// XCSnapshot returns the currently published typed XC catalog generation.
+func (sp *StreamProxy) XCSnapshot() *types.XCCatalogSnapshot {
+	return sp.Channels.xcSnapshot()
+}
+
+// RegisterXCEpisode publishes a lazily fetched episode for the current catalog
+// generation. The public ID is derived, while the provider ID remains on the
+// record for upstream playback.
+func (sp *StreamProxy) RegisterXCEpisode(generation *types.XCCatalogSnapshot, record *types.XCRecord) error {
+	if generation == nil || generation != sp.XCSnapshot() || record == nil || record.Identity.ContentType != types.ContentTypeEpisode {
+		return fmt.Errorf("invalid or stale XC episode registration")
+	}
+	sp.xcEpisodeMutex.Lock()
+	defer sp.xcEpisodeMutex.Unlock()
+	if sp.xcEpisodeGeneration != generation {
+		sp.xcEpisodeGeneration = generation
+		sp.xcEpisodes = make(map[int]*types.XCRecord)
+	}
+	if existing := generation.Lookup(types.ContentTypeEpisode, record.Identity.OutputID); existing != nil {
+		return fmt.Errorf("XC episode output ID collision for %d", record.Identity.OutputID)
+	}
+	if existing := sp.xcEpisodes[record.Identity.OutputID]; existing != nil {
+		if existing.Identity.ProviderID == record.Identity.ProviderID &&
+			existing.Identity.ProviderSource == record.Identity.ProviderSource &&
+			existing.Identity.ProviderSeriesID == record.Identity.ProviderSeriesID {
+			return nil
+		}
+		return fmt.Errorf("XC episode output ID collision for %d", record.Identity.OutputID)
+	}
+	sp.xcEpisodes[record.Identity.OutputID] = record
+	return nil
+}
+
+// LookupXCRecord resolves catalog and generation-scoped lazy episode records.
+func (sp *StreamProxy) LookupXCRecord(contentType types.ContentType, outputID int) *types.XCRecord {
+	if record := sp.XCSnapshot().Lookup(contentType, outputID); record != nil {
+		return record
+	}
+	if contentType != types.ContentTypeEpisode {
+		return nil
+	}
+	sp.xcEpisodeMutex.RLock()
+	defer sp.xcEpisodeMutex.RUnlock()
+	if sp.xcEpisodeGeneration != sp.XCSnapshot() {
+		return nil
+	}
+	return sp.xcEpisodes[outputID]
 }
 
 // getChannelBatch snapshots the current channel map into an ordered slice for batch
@@ -187,12 +368,16 @@ func (sp *StreamProxy) ImportStreams() {
 	logger.Debug("{proxy/stream - ImportStreams} Starting stream import for %d configured sources", len(sp.Config.Sources))
 
 	if len(sp.Config.Sources) == 0 {
-		logger.Warn("{proxy/stream - ImportStreams} No sources configured, skipping import")
+		logger.Warn("{proxy/stream - ImportStreams} No sources configured, publishing empty channel generation")
+		empty, _ := types.NewXCCatalogSnapshot(nil)
+		sp.Channels.replace(xsync.NewMapOf[string, *types.Channel](), empty)
 		return
 	}
 
 	var wg sync.WaitGroup
 	newChannels := xsync.NewMapOf[string, *types.Channel]()
+	var completeGeneration atomic.Bool
+	completeGeneration.Store(true)
 
 	importSemaphore := make(chan struct{}, sp.Config.WorkerThreads)
 	for i := range sp.Config.Sources {
@@ -206,6 +391,7 @@ func (sp *StreamProxy) ImportStreams() {
 
 			currentConns := src.ActiveConns.Load()
 			if currentConns >= int32(src.MaxConnections) {
+				completeGeneration.Store(false)
 				logger.Warn("{proxy/stream - ImportStreams} Cannot import from source (connection limit %d/%d): %s",
 					currentConns, src.MaxConnections, utils.LogURL(sp.Config, src.URL))
 				return
@@ -226,7 +412,12 @@ func (sp *StreamProxy) ImportStreams() {
 			var streams []*types.Stream
 			if src.Username != "" && src.Password != "" {
 				logger.Debug("{proxy/stream - ImportStreams} Parsing Xtreme Codes API source: %s", src.Name)
-				streams = parser.ParseXtremeCodesAPI(sp.HttpClient, sp.Config, src, rateLimiter, sp.Cache)
+				var complete bool
+				streams, complete = parser.ParseXtremeCodesAPIWithStatus(sp.HttpClient, sp.Config, src, rateLimiter, sp.Cache)
+				if !complete {
+					completeGeneration.Store(false)
+					return
+				}
 			} else {
 				logger.Debug("{proxy/stream - ImportStreams} Parsing M3U8 source: %s", src.Name)
 				streams = parser.ParseM3U8(sp.HttpClient, sp.Config, src, rateLimiter, sp.Cache)
@@ -273,7 +464,12 @@ func (sp *StreamProxy) ImportStreams() {
 	case <-done:
 		logger.Debug("{proxy/stream - ImportStreams} All source imports completed successfully")
 	case <-time.After(constants.Internal.ImportGlobalTimeout):
-		logger.Warn("{proxy/stream - ImportStreams} Global timeout reached (%v), some sources may not have completed", constants.Internal.ImportGlobalTimeout)
+		logger.Warn("{proxy/stream - ImportStreams} Global timeout reached (%v), retaining previous channel and XC catalog generation", constants.Internal.ImportGlobalTimeout)
+		return
+	}
+	if !completeGeneration.Load() {
+		logger.Warn("{proxy/stream - ImportStreams} Incomplete source generation, retaining previous channel and XC catalog snapshots")
+		return
 	}
 
 	// Zero out ActiveConns for all sources — import connections are
@@ -288,7 +484,7 @@ func (sp *StreamProxy) ImportStreams() {
 		allOverrides = make(map[string]map[string]db.StreamOverride)
 	}
 
-	count := 0
+	completedChannels := make([]*types.Channel, 0, 1000)
 	newChannels.Range(func(key string, value *types.Channel) bool {
 		channelName := key
 		channel := value
@@ -307,10 +503,16 @@ func (sp *StreamProxy) ImportStreams() {
 			atomic.StoreInt32(&channel.PreferredStreamIndex, existingPreferred)
 		}
 
-		sp.Channels.Store(key, channel)
-		count++
+		completedChannels = append(completedChannels, channel)
 		return true
 	})
+
+	xcSnapshot, err := BuildXCSnapshot(completedChannels)
+	if err != nil {
+		logger.Error("{proxy/stream - ImportStreams} Refusing incomplete XC catalog generation: %v", err)
+		return
+	}
+	sp.Channels.replace(newChannels, xcSnapshot)
 
 }
 
@@ -346,15 +548,11 @@ func streamResponseContentType(channel *types.Channel) string {
 // Channels are sorted according to the configured sort field and direction before
 // rendering. Each channel entry includes its stream attributes and a proxy URL pointing
 // back to this server for transparent stream proxying.
-func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, groupFilter string, account *config.XCOutputAccount) {
+func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, groupFilter string, account *XCAccount) {
 	logger.Debug("{proxy/stream - GeneratePlaylist} Playlist request from: %s (%s)",
 		r.RemoteAddr, r.Header.Get("User-Agent"))
 
-	// construct cache key per account with optional group filter suffix
-	cacheKey := fmt.Sprintf("playlist_%s", account.Username)
-	if groupFilter != "" {
-		cacheKey = fmt.Sprintf("playlist_%s_%s", account.Username, strings.ToLower(groupFilter))
-	}
+	cacheKey := playlistCacheKey(*account, sp.XCSnapshot().Generation, groupFilter)
 
 	// serve from cache if available
 	if sp.Config.CacheEnabled {
@@ -394,8 +592,8 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 
 	for _, ch := range channels {
 		ch.channel.Mu.RLock()
-		if len(ch.channel.Streams) > 0 {
-			stream := ch.channel.Streams[0]
+		stream := firstAllowedStream(ch.channel.Streams, account)
+		if stream != nil {
 			attrs := stream.Attributes
 
 			// skip channels that don't match the group filter
@@ -405,22 +603,6 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 					ch.channel.Mu.RUnlock()
 					continue
 				}
-			}
-
-			contentType := streamContentType(stream)
-
-			// skip channels that don't match the account content settings
-			if contentType == "live" && !account.EnableLive {
-				ch.channel.Mu.RUnlock()
-				continue
-			}
-			if contentType == "vod" && !account.EnableVOD {
-				ch.channel.Mu.RUnlock()
-				continue
-			}
-			if contentType == "series" && !account.EnableSeries {
-				ch.channel.Mu.RUnlock()
-				continue
 			}
 
 			filteredCount++
@@ -449,7 +631,11 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 			cleanName := utils.SanitizeM3UDisplayName(strings.Trim(ch.name, "\""))
 			playlist.WriteString(fmt.Sprintf(",%s\n", cleanName))
 			safeName := utils.SanitizeChannelName(ch.name)
-			proxyURL := fmt.Sprintf("%s/s/%s/%s/%s", sp.Config.BaseURL, account.Username, account.Password, safeName)
+			proxyURL, err := utils.AppendURLPath(sp.Config.BaseURL, "s", account.Config.Username, account.Config.Password, safeName)
+			if err != nil {
+				ch.channel.Mu.RUnlock()
+				continue
+			}
 			playlist.WriteString(proxyURL)
 			playlist.WriteByte('\n')
 		}
@@ -473,6 +659,31 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 	} else {
 		logger.Debug("{proxy/stream - GeneratePlaylist} Generated playlist for group '%s' with %d channels (out of %d total)", groupFilter, filteredCount, len(channels))
 	}
+}
+
+func firstAllowedStream(streams []*types.Stream, account *XCAccount) *types.Stream {
+	for _, stream := range streams {
+		switch streamContentType(stream) {
+		case "live":
+			if account.Config.EnableLive {
+				return stream
+			}
+		case "vod":
+			if account.Config.EnableVOD {
+				return stream
+			}
+		case "series":
+			if account.Config.EnableSeries {
+				return stream
+			}
+		}
+	}
+	return nil
+}
+
+func playlistCacheKey(account XCAccount, catalogGeneration uint64, groupFilter string) string {
+	identity := fmt.Sprintf("%d\x00%d\x00%d\x00%s", account.Config.ID, account.Generation, catalogGeneration, strings.ToLower(groupFilter))
+	return "playlist_" + utils.HashURL(identity)
 }
 
 // GetChannelGroup extracts the group classification from channel attributes by checking
@@ -680,7 +891,10 @@ func (sp *StreamProxy) FindChannelBySafeName(safeName string) string {
 //
 // When the watcher system is enabled, stream quality monitoring is automatically started
 // for the active restreaming session to enable automatic failover on quality degradation.
-func (sp *StreamProxy) HandleRestreamingClient(w http.ResponseWriter, r *http.Request, channel *types.Channel) {
+func (sp *StreamProxy) HandleRestreamingClient(w http.ResponseWriter, r *http.Request, channel *types.Channel, leases ...*XCPlaybackLease) {
+	if len(leases) > 0 && leases[0] != nil {
+		defer leases[0].Release()
+	}
 
 	// Acquire global connection slot
 	select {

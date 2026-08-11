@@ -176,6 +176,7 @@ func reloadXCAccounts(sp *proxy.StreamProxy) {
 	sp.Config.XCOutputAccounts = make([]config.XCOutputAccount, len(accounts))
 	for i, a := range accounts {
 		sp.Config.XCOutputAccounts[i] = config.XCOutputAccount{
+			ID:             a.ID,
 			Name:           a.Name,
 			Username:       a.Username,
 			Password:       a.Password,
@@ -185,4 +186,5 @@ func reloadXCAccounts(sp *proxy.StreamProxy) {
 			EnableVOD:      a.EnableVOD,
 		}
 	}
+	sp.AccountRegistry().Replace(sp.Config.XCOutputAccounts)
 }

@@ -2,7 +2,9 @@ package types
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +40,63 @@ const (
 	ContentTypeLive    ContentType = "live"
 	ContentTypeVOD     ContentType = "vod"
 	ContentTypeSeries  ContentType = "series"
+	ContentTypeEpisode ContentType = "episode"
 )
+
+// XCIdentity is the stable identity needed to resolve an XC record without
+// depending on its display name.
+type XCIdentity struct {
+	ContentType      ContentType
+	ProviderID       string
+	ProviderSource   string
+	ProviderSeriesID string
+	OutputID         int
+}
+
+// XCRecord associates one typed XC catalog item with its shared restream
+// channel. The stream is the canonical imported record for its content type.
+type XCRecord struct {
+	Identity XCIdentity
+	Name     string
+	Channel  *Channel
+	Stream   *Stream
+}
+
+// XCCatalogSnapshot is an immutable, generation-scoped XC lookup table.
+type XCCatalogSnapshot struct {
+	Generation uint64
+	Records    []*XCRecord
+	byID       map[string]*XCRecord
+}
+
+var xcCatalogGeneration atomic.Uint64
+
+func NewXCCatalogSnapshot(records []*XCRecord) (*XCCatalogSnapshot, error) {
+	snapshot := &XCCatalogSnapshot{
+		Generation: xcCatalogGeneration.Add(1),
+		Records:    records,
+		byID:       make(map[string]*XCRecord, len(records)),
+	}
+	for _, record := range records {
+		key := xcLookupKey(record.Identity.ContentType, record.Identity.OutputID)
+		if existing := snapshot.byID[key]; existing != nil && existing.Channel != record.Channel {
+			return nil, fmt.Errorf("XC output ID collision for %s %d: %q and %q", record.Identity.ContentType, record.Identity.OutputID, existing.Name, record.Name)
+		}
+		snapshot.byID[key] = record
+	}
+	return snapshot, nil
+}
+
+func (s *XCCatalogSnapshot) Lookup(contentType ContentType, outputID int) *XCRecord {
+	if s == nil {
+		return nil
+	}
+	return s.byID[xcLookupKey(contentType, outputID)]
+}
+
+func xcLookupKey(contentType ContentType, outputID int) string {
+	return string(contentType) + ":" + strconv.Itoa(outputID)
+}
 
 // Stream represents a single streamable content source with comprehensive metadata,
 // reliability tracking, and format-specific configuration. Each stream corresponds to
@@ -61,6 +119,8 @@ type Stream struct {
 	Mu                 sync.Mutex           // Mutex for thread-safe access to non-atomic fields (LastFail, ResolvedURL)
 	StreamType         StreamType           // Content type classification for specialized processing logic
 	ContentType        ContentType          // Semantic content kind (live, vod, or series), when known
+	ProviderID         string               // Provider stream/series/episode ID, preserved without numeric coercion
+	ProviderSource     string               // Stable provider source identity used for detail and playback lookup
 	ContainerExtension string               // Media container extension used for VOD URLs, when known
 	ResolvedURL        string               // For HLS master playlists, contains the selected variant URL
 	LastChecked        time.Time            // Timestamp of most recent stream validation or health check

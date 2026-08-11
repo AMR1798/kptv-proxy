@@ -156,6 +156,7 @@ func handleSetConfig(sp *proxy.StreamProxy) http.HandlerFunc {
 		// Reload from SQLite and swap the live config pointer so the saved
 		// settings apply immediately, not only after a graceful restart
 		sp.Config = config.LoadConfig()
+		sp.AccountRegistry().Replace(sp.Config.XCOutputAccounts)
 
 		addLogEntry("info", "Configuration updated via admin interface")
 

@@ -14,6 +14,7 @@ import (
 	"kptv-proxy/work/parser"
 	"kptv-proxy/work/stream"
 	"kptv-proxy/work/types"
+	"kptv-proxy/work/utils"
 	"net/http"
 	"os"
 	"strconv"
@@ -695,10 +696,10 @@ func (r *Restream) StreamFromSource(index int) (bool, int64) {
 
 		// loop over all variants to test them
 		for i, variant := range variants {
-			logger.Debug("{restream/restream - StreamFromSource} Channel %s: Testing variant %d (%s)", r.Channel.Name, i, variant.URL)
+			logger.Debug("{restream/restream - StreamFromSource} Channel %s: Testing variant %d (%s)", r.Channel.Name, i, utils.LogURL(r.Config, variant.URL))
 
 			if ok, bytes := r.testAndStreamVariant(variant, stream.Source); ok {
-				logger.Debug("{restream/restream - StreamFromSource} Channel %s: Successfully streamed variant %d (%s)", r.Channel.Name, i, variant.URL)
+				logger.Debug("{restream/restream - StreamFromSource} Channel %s: Successfully streamed variant %d (%s)", r.Channel.Name, i, utils.LogURL(r.Config, variant.URL))
 
 				return true, bytes
 			}
@@ -726,7 +727,7 @@ func (r *Restream) StreamFromSource(index int) (bool, int64) {
 //   - context.CancelFunc: caller must invoke when done with the response
 //   - error: any encountered error
 func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([]parser.StreamVariant, bool, *http.Response, context.CancelFunc, error) {
-	logger.Debug("{restream/restream - getStreamVariants} Fetching variants for channel %s from URL: %s", r.Channel.Name, url)
+	logger.Debug("{restream/restream - getStreamVariants} Fetching variants for channel %s from URL: %s", r.Channel.Name, utils.LogURL(r.Config, url))
 
 	// Initialize a master playlist handler
 	masterHandler := parser.NewMasterPlaylistHandler(r.Config)
@@ -734,8 +735,8 @@ func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([
 	// Build HTTP GET request for the stream URL
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		logger.Error("{restream/restream - getStreamVariants} Failed to create request for channel %s: %v", r.Channel.Name, err)
-		return nil, false, nil, nil, err
+		logger.Error("{restream/restream - getStreamVariants} Failed to create request for channel %s", r.Channel.Name)
+		return nil, false, nil, nil, fmt.Errorf("invalid stream URL")
 	}
 
 	// Cancellable child context with a validation timer instead of a hard
@@ -750,8 +751,8 @@ func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([
 	if err != nil {
 		validationTimer.Stop()
 		cancel()
-		logger.Error("{restream/restream - getStreamVariants} HTTP request failed for channel %s: %v", r.Channel.Name, err)
-		return nil, false, nil, nil, err
+		logger.Error("{restream/restream - getStreamVariants} HTTP request failed for channel %s", r.Channel.Name)
+		return nil, false, nil, nil, fmt.Errorf("stream request failed")
 	}
 
 	// Non-200 response codes are considered fatal
@@ -798,7 +799,7 @@ func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([
 //   - bool: success flag
 //   - int64: number of bytes streamed
 func (r *Restream) testAndStreamVariant(variant parser.StreamVariant, source *config.SourceConfig) (bool, int64) {
-	logger.Debug("{restream/restream - testAndStreamVariant} Testing variant for channel %s: %s (resolution: %s)", r.Channel.Name, variant.URL, variant.Resolution)
+	logger.Debug("{restream/restream - testAndStreamVariant} Testing variant for channel %s: %s (resolution: %s)", r.Channel.Name, utils.LogURL(r.Config, variant.URL), variant.Resolution)
 
 	// Use FFmpeg if enabled, bypassing all variant testing
 	if r.Config.FFmpegMode {
@@ -809,7 +810,7 @@ func (r *Restream) testAndStreamVariant(variant parser.StreamVariant, source *co
 	// Build HTTP GET request for the variant
 	testReq, err := http.NewRequest("GET", variant.URL, nil)
 	if err != nil {
-		logger.Warn("{restream/restream - testAndStreamVariant} Failed to create request for channel %s: %v", r.Channel.Name, err)
+		logger.Warn("{restream/restream - testAndStreamVariant} Failed to create request for channel %s", r.Channel.Name)
 		return false, 0
 	}
 
@@ -824,7 +825,7 @@ func (r *Restream) testAndStreamVariant(variant parser.StreamVariant, source *co
 	resp, err := r.HttpClient.DoWithHeaders(testReq, source.UserAgent, source.ReqOrigin, source.ReqReferrer)
 	if err != nil {
 		validationTimer.Stop()
-		logger.Warn("{restream/restream - testAndStreamVariant} HTTP request failed for channel %s: %v", r.Channel.Name, err)
+		logger.Warn("{restream/restream - testAndStreamVariant} HTTP request failed for channel %s", r.Channel.Name)
 		return false, 0
 	}
 

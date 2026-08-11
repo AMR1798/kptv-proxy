@@ -396,8 +396,8 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, time.Du
 	// Build HTTP request with appropriate timeout for playlist fetching
 	req, err := http.NewRequest("GET", playlistURL, nil)
 	if err != nil {
-		logger.Error("{restream/hls - getHLSSegments} Failed to create request for channel %s: %v", r.Channel.Name, err)
-		return nil, "", 0, err
+		logger.Error("{restream/hls - getHLSSegments} Failed to create request for channel %s", r.Channel.Name)
+		return nil, "", 0, fmt.Errorf("invalid HLS playlist URL")
 	}
 
 	// Create context with timeout to prevent hanging on slow/dead servers
@@ -417,8 +417,8 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, time.Du
 	}
 
 	if err != nil {
-		logger.Error("{restream/hls - getHLSSegments} Request failed for channel %s: %v", r.Channel.Name, err)
-		return nil, "", 0, err
+		logger.Error("{restream/hls - getHLSSegments} Request failed for channel %s", r.Channel.Name)
+		return nil, "", 0, fmt.Errorf("HLS playlist request failed")
 	}
 	defer resp.Body.Close()
 
@@ -617,8 +617,8 @@ func (r *Restream) streamSegment(segmentURL, playlistURL string, targetDuration 
 	// Build HTTP request for segment
 	req, err := http.NewRequest("GET", segmentURL, nil)
 	if err != nil {
-		logger.Error("{restream/hls - streamSegment} Failed to create request for channel %s: %v", r.Channel.Name, err)
-		return 0, err
+		logger.Error("{restream/hls - streamSegment} Failed to create request for channel %s", r.Channel.Name)
+		return 0, fmt.Errorf("invalid HLS segment URL")
 	}
 
 	// If URL was resolved from tracking URL, set original as Referer for analytics
@@ -651,8 +651,8 @@ func (r *Restream) streamSegment(segmentURL, playlistURL string, targetDuration 
 	}
 
 	if err != nil {
-		logger.Error("{restream/hls - streamSegment} Request failed for channel %s: %v", r.Channel.Name, err)
-		return 0, err
+		logger.Error("{restream/hls - streamSegment} Request failed for channel %s", r.Channel.Name)
+		return 0, fmt.Errorf("HLS segment request failed")
 	}
 	defer resp.Body.Close()
 

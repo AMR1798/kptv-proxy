@@ -46,6 +46,24 @@ func NormalizeContainerExtension(extension string) string {
 	return strings.ToLower(extension)
 }
 
+// AppendURLPath appends independently escaped path segments to a base URL.
+func AppendURLPath(baseURL string, segments ...string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+
+	path := strings.TrimSuffix(u.Path, "/")
+	escapedPath := strings.TrimSuffix(u.EscapedPath(), "/")
+	for _, segment := range segments {
+		path += "/" + segment
+		escapedPath += "/" + url.PathEscape(segment)
+	}
+	u.Path = path
+	u.RawPath = escapedPath
+	return u.String(), nil
+}
+
 // ContentTypeOfStream resolves a stream's semantic content type. Explicit XC
 // metadata wins; legacy streams use the historical name/URL/group heuristics.
 func ContentTypeOfStream(stream *types.Stream) types.ContentType {
@@ -53,7 +71,7 @@ func ContentTypeOfStream(stream *types.Stream) types.ContentType {
 		return types.ContentTypeLive
 	}
 	switch stream.ContentType {
-	case types.ContentTypeLive, types.ContentTypeVOD, types.ContentTypeSeries:
+	case types.ContentTypeLive, types.ContentTypeVOD, types.ContentTypeSeries, types.ContentTypeEpisode:
 		return stream.ContentType
 	}
 	if SeriesRegex != nil && (SeriesRegex.MatchString(stream.Name) || SeriesRegex.MatchString(stream.URL)) {
@@ -94,6 +112,7 @@ func ContentTypeOfStream(stream *types.Stream) types.ContentType {
 // Returns:
 //   - string: original URL if obfuscation disabled, or privacy-protected version with sensitive parts masked
 func LogURL(cfg *config.Config, url string) string {
+	url = RedactURLCredentials(url)
 
 	// Check configuration setting to determine if URL obfuscation is enabled
 	if cfg.ObfuscateUrls {
@@ -119,10 +138,60 @@ func LogURL(cfg *config.Config, url string) string {
 // Returns:
 //   - string: original URL if obfuscation disabled, or privacy-protected version with sensitive components masked
 func LogURLWithFlag(obfuscate bool, url string) string {
+	url = RedactURLCredentials(url)
 	if obfuscate {
 		return ObfuscateURL(url)
 	}
 	return url
+}
+
+// RedactURLCredentials removes credentials from standard XC query and path
+// locations while retaining enough URL structure for diagnostics.
+func RedactURLCredentials(urlStr string) string {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "***REDACTED***"
+	}
+	if u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			u.User = url.UserPassword("***", "***")
+		} else {
+			u.User = url.User("***")
+		}
+	}
+
+	query := u.Query()
+	queryChanged := false
+	for _, key := range []string{"username", "password"} {
+		if _, ok := query[key]; ok {
+			query.Set(key, "***")
+			queryChanged = true
+		}
+	}
+	if queryChanged {
+		u.RawQuery = query.Encode()
+	}
+
+	escapedSegments := strings.Split(u.EscapedPath(), "/")
+	for i, escapedSegment := range escapedSegments {
+		segment, err := url.PathUnescape(escapedSegment)
+		if err != nil {
+			return "***REDACTED***"
+		}
+		switch segment {
+		case "live", "movie", "series", "s", "pl", "playlist", "epg", "epg.xml":
+			if i+2 < len(escapedSegments) {
+				escapedSegments[i+1] = "***"
+				escapedSegments[i+2] = "***"
+			}
+		}
+	}
+	u.RawPath = strings.Join(escapedSegments, "/")
+	u.Path, err = url.PathUnescape(u.RawPath)
+	if err != nil {
+		return "***REDACTED***"
+	}
+	return u.String()
 }
 
 // SanitizeChannelName transforms channel names into URL-safe identifiers by replacing

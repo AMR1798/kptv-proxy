@@ -10,6 +10,7 @@ import (
 	"kptv-proxy/work/logger"
 	"kptv-proxy/work/metrics"
 	"kptv-proxy/work/types"
+	"kptv-proxy/work/utils"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -41,7 +42,7 @@ func (r *Restream) streamWithFFmpeg(streamURL string) (bool, int64) {
 	}
 	r.Channel.Mu.RUnlock()
 
-	logger.Debug("{restream/ffmpeg - streamWithFFmpeg} Starting FFmpeg for channel %s with URL: %s", r.Channel.Name, streamURL)
+	logger.Debug("{restream/ffmpeg - streamWithFFmpeg} Starting FFmpeg for channel %s with URL: %s", r.Channel.Name, utils.LogURL(r.Config, streamURL))
 
 	// Build FFmpeg command arguments
 	// Start with base args to suppress banner and set error-only logging
@@ -65,7 +66,7 @@ func (r *Restream) streamWithFFmpeg(streamURL string) (bool, int64) {
 	args = append(args, r.Config.FFmpegPreOutput...)
 	args = append(args, "pipe:1")
 
-	logger.Debug("{restream/ffmpeg - streamWithFFmpeg} Command args for channel %s: %v", r.Channel.Name, args)
+	logger.Debug("{restream/ffmpeg - streamWithFFmpeg} Command prepared for channel %s", r.Channel.Name)
 
 	// Create cancellable context for FFmpeg process
 	ctx, cancel := context.WithCancel(r.Context())
@@ -125,8 +126,7 @@ func (r *Restream) streamWithFFmpeg(streamURL string) (bool, int64) {
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
-			// Log FFmpeg errors/warnings as debug since we already log major errors separately
-			logger.Debug("{restream/ffmpeg - streamWithFFmpeg} Channel %s: %s", r.Channel.Name, scanner.Text())
+			logger.Debug("{restream/ffmpeg - streamWithFFmpeg} FFmpeg reported an input diagnostic for channel %s", r.Channel.Name)
 		}
 		if err := scanner.Err(); err != nil {
 			logger.Error("{restream/ffmpeg - streamWithFFmpeg} reading stderr for channel %s: %v", r.Channel.Name, err)
