@@ -44,8 +44,8 @@ func TestGetChannelContentTypePrefersExplicitType(t *testing.T) {
 }
 
 func TestBuildXCStreamURLUsesVODExtensionAndPath(t *testing.T) {
-	got := buildXCStreamURL("http://proxy", "vod", "u", "p", 42, ".MKV")
-	if got != "http://proxy/movie/u/p/42.mkv" {
+	got := buildXCStreamURL("http://proxy", "vod", "u", "sec#ret", 42, ".MKV")
+	if got != "http://proxy/movie/u/sec%23ret/42.mkv" {
 		t.Fatalf("buildXCStreamURL() = %q, want VOD path with normalized extension", got)
 	}
 	if got := buildXCStreamURL("http://proxy", "live", "u", "p", 42, "mp4"); got != "http://proxy/live/u/p/42.ts" {
@@ -346,5 +346,49 @@ func TestPrepareXCSeriesEpisodesScopesPublicIDsBySourceAndSeries(t *testing.T) {
 		if parsed.Host != stream.host || !strings.HasSuffix(parsed.Path, "/series/provider-user/provider-pass/shared-episode.mkv") {
 			t.Errorf("upstream episode URL = %q", parsed.String())
 		}
+	}
+}
+
+func TestHandleXCStreamRedirectsM3U8LiveRequestToTS(t *testing.T) {
+	const (
+		username = "viewer"
+		password = "sec#ret"
+	)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("action") {
+		case "get_live_streams":
+			_, _ = w.Write([]byte(`[{"stream_id":1,"name":"Test Channel","category_id":"1"}]`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer provider.Close()
+	sp := newXCHandlerTestProxy(t, provider.URL, config.XCOutputAccount{
+		ID: 1, Username: username, Password: password, MaxConnections: 1, EnableLive: true,
+	})
+	streamID := proxy.XCOutputID("Test Channel")
+
+	rawID := fmt.Sprintf("%d.m3u8", streamID)
+	requestPath := "/kptv/live/" + username + "/" + url.PathEscape(password) + "/" + rawID + "?token=abc"
+	req := httptest.NewRequest(http.MethodGet, requestPath, nil)
+	response := httptest.NewRecorder()
+	router := mux.NewRouter()
+	router.HandleFunc("/kptv/live/{username}/{password}/{id}", HandleXCLiveStream(sp))
+	router.ServeHTTP(response, req)
+
+	if response.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusTemporaryRedirect)
+	}
+	wantLocation := fmt.Sprintf("%d.ts?token=abc", streamID)
+	if got := response.Header().Get("Location"); got != wantLocation {
+		t.Fatalf("Location = %q, want %q", got, wantLocation)
+	}
+	redirectURL, err := req.URL.Parse(wantLocation)
+	if err != nil {
+		t.Fatalf("resolving redirect: %v", err)
+	}
+	wantPath := fmt.Sprintf("/kptv/live/%s/%s/%d.ts", username, url.PathEscape(password), streamID)
+	if got := redirectURL.EscapedPath(); got != wantPath {
+		t.Fatalf("resolved redirect path = %q, want %q", got, wantPath)
 	}
 }

@@ -721,8 +721,18 @@ func HandleXCGetPHP(sp *proxy.StreamProxy) http.HandlerFunc {
 	}
 }
 
-// HandleXCStream handles direct stream requests from XC clients.
+// HandleXCLiveStream handles live XC requests and canonicalizes misleading
+// .m3u8 URLs before the continuous MPEG-TS response starts.
+func HandleXCLiveStream(sp *proxy.StreamProxy) http.HandlerFunc {
+	return handleXCStream(sp, true)
+}
+
+// HandleXCStream handles direct VOD and series stream requests from XC clients.
 func HandleXCStream(sp *proxy.StreamProxy) http.HandlerFunc {
+	return handleXCStream(sp, false)
+}
+
+func handleXCStream(sp *proxy.StreamProxy, redirectM3U8 bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 		username := vars["username"]
@@ -765,6 +775,16 @@ func HandleXCStream(sp *proxy.StreamProxy) http.HandlerFunc {
 		channel := typedPlaybackChannel(record)
 		if channel == nil {
 			http.Error(w, "Stream not found", http.StatusNotFound)
+			return
+		}
+
+		if redirectM3U8 && strings.HasSuffix(strings.ToLower(rawID), ".m3u8") {
+			location := id + ".ts"
+			if r.URL.RawQuery != "" {
+				location += "?" + r.URL.RawQuery
+			}
+			w.Header().Set("Location", location)
+			w.WriteHeader(http.StatusTemporaryRedirect)
 			return
 		}
 
