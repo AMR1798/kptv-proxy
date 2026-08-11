@@ -356,9 +356,9 @@ func TestParseXtremeCodesAPIFallsBackWhenCategoryEndpointFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	streams := ParseXtremeCodesAPI(client.NewHeaderSettingClient(time.Second), &config.Config{WorkerThreads: 1}, &config.SourceConfig{URL: server.URL, Username: "u", Password: "p"}, nil, xcCache)
-	if len(streams) != 1 || streams[0].Attributes["group-title"] != "vod" {
-		t.Fatalf("fallback VOD category = %#v, want group-title vod", streams)
+	streams, complete := ParseXtremeCodesAPIWithStatus(client.NewHeaderSettingClient(time.Second), &config.Config{WorkerThreads: 1}, &config.SourceConfig{URL: server.URL, Username: "u", Password: "p"}, nil, xcCache)
+	if len(streams) != 1 || streams[0].Attributes["group-title"] != "vod" || !complete {
+		t.Fatalf("fallback VOD category = %#v, complete=%t; want group-title vod and publishable catalog", streams, complete)
 	}
 	streams = ParseXtremeCodesAPI(client.NewHeaderSettingClient(time.Second), &config.Config{WorkerThreads: 1}, &config.SourceConfig{URL: server.URL, Username: "u", Password: "p"}, nil, xcCache)
 	if len(streams) != 1 || streams[0].Attributes["group-title"] != "vod" {

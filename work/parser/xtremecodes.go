@@ -485,8 +485,9 @@ func ParseXtremeCodesAPIWithStatus(httpClient *client.HeaderSettingClient, cfg *
 	})...)
 
 	logger.Debug("{parser/xtremecodes - ParseXtremeCodesAPI} XC API parsing complete: %d total streams", len(allStreams))
-	complete := ctx.Err() == nil && liveCategoryOK && seriesCategoryOK && vodCategoryOK && liveOK && seriesOK && vodOK
-	if complete {
+	complete := ctx.Err() == nil && liveOK && seriesOK && vodOK
+	cacheable := complete && liveCategoryOK && seriesCategoryOK && vodCategoryOK
+	if cacheable {
 		if len(allStreams) > 0 {
 			if data, err := json.Marshal(allStreams); err == nil {
 				cache.SetXCData(cacheKey, string(data))
@@ -496,7 +497,7 @@ func ParseXtremeCodesAPIWithStatus(httpClient *client.HeaderSettingClient, cfg *
 			logger.Debug("{parser/xtremecodes - ParseXtremeCodesAPI} Valid-empty XC catalog for %s was not cached", source.Name)
 		}
 	} else {
-		logger.Debug("{parser/xtremecodes - ParseXtremeCodesAPI} Skipping cache after incomplete XC fetch (live-category=%t, series-category=%t, vod-category=%t, live=%t, series=%t, vod=%t)", liveCategoryOK, seriesCategoryOK, vodCategoryOK, liveOK, seriesOK, vodOK)
+		logger.Debug("{parser/xtremecodes - ParseXtremeCodesAPI} Skipping cache after incomplete XC fetch or metadata (live-category=%t, series-category=%t, vod-category=%t, live=%t, series=%t, vod=%t)", liveCategoryOK, seriesCategoryOK, vodCategoryOK, liveOK, seriesOK, vodOK)
 	}
 	return allStreams, complete
 }
